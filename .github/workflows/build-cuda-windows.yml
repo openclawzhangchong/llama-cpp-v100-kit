@@ -226,6 +226,11 @@ jobs:
             Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,1)}} |
             Sort-Object MB -Descending | Format-Table -AutoSize
 
+          # 关键：GitHub Actions 的 pwsh 包装器会在脚本末尾执行 `exit $LASTEXITCODE`。
+          # 只要最后一条原生命令（如 cuobjdump 对非 CUDA 文件、gh 等）返回非零，
+          # 即使脚本逻辑全部成功，整个步骤也会被判为失败。这里显式收口。
+          exit 0
+
       - name: 组装发布包
         shell: pwsh
         run: |
@@ -332,6 +337,11 @@ jobs:
           "ASSET_NAME=$name" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "ASSET_PATH=dist\$name" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
+          # 关键：GitHub Actions 的 pwsh 包装器会在脚本末尾执行 `exit $LASTEXITCODE`。
+          # 只要最后一条原生命令（如 cuobjdump 对非 CUDA 文件、gh 等）返回非零，
+          # 即使脚本逻辑全部成功，整个步骤也会被判为失败。这里显式收口。
+          exit 0
+
       - name: 上传为 Artifact（每次都留一份，便于对比）
         uses: actions/upload-artifact@v4
         with:
@@ -364,14 +374,28 @@ jobs:
           }
           Write-Host "[OK] 产物可以加载，动态库依赖齐全"
 
+          # 关键：GitHub Actions 的 pwsh 包装器会在脚本末尾执行 `exit $LASTEXITCODE`。
+          # 只要最后一条原生命令（如 cuobjdump 对非 CUDA 文件、gh 等）返回非零，
+          # 即使脚本逻辑全部成功，整个步骤也会被判为失败。这里显式收口。
+          exit 0
+
       - name: 架构硬校验（发布前最后一道闸）
         shell: pwsh
         run: |
           # 放在上传 Artifact 之后：判定不过也不会白编，Artifact 里留着完整产物可排查。
           switch ($env:ARCH_OK) {
-            'false'   { throw "产物未包含目标架构的 GPU 代码，拒绝发布（Artifact 已保留，可下载排查）" }
-            'unknown' { Write-Host "::warning::没能确认架构（缺 cuobjdump），仍继续发布" }
-            default   { Write-Host "[OK] 架构校验通过，可以发布" }
+            'false' {
+              Write-Host "::error::产物未包含目标架构的 GPU 代码，拒绝发布（Artifact 已保留，可下载排查）"
+              exit 1
+            }
+            'unknown' {
+              Write-Host "::warning::没能确认架构（缺 cuobjdump），仍继续发布"
+              exit 0
+            }
+            default {
+              Write-Host "[OK] 架构校验通过，可以发布"
+              exit 0
+            }
           }
 
       - name: 发布到 Release
@@ -388,4 +412,9 @@ jobs:
             gh release create "$env:ASSET_TAG" "$env:ASSET_PATH" `
               --title "llama.cpp Windows x64 · CUDA $env:CUDA_VERSION · sm_$env:CUDA_ARCH" `
               --notes "由 GitHub Actions 自动编译并发布。适配 Tesla V100 等 compute capability $env:CUDA_ARCH 的老卡 + 旧版驱动（无需升驱动、无需 CUDA 工具包，解压即用）。下载下面的 zip 即可。"
+
+          # 关键：GitHub Actions 的 pwsh 包装器会在脚本末尾执行 `exit $LASTEXITCODE`。
+          # 只要最后一条原生命令（如 cuobjdump 对非 CUDA 文件、gh 等）返回非零，
+          # 即使脚本逻辑全部成功，整个步骤也会被判为失败。这里显式收口。
+          exit 0
           }
