@@ -1,0 +1,29 @@
+# 换行与编码策略
+# ---------------------------------------------------------------------------
+# 重点：scripts/*.bat 是 GBK 编码的中文批处理，必须原样传输。
+#   Windows 中文 cmd 的代码页是 936(GBK)，UTF-8 的中文 bat 会乱码甚至闪退；
+#   同时 bat 必须是 CRLF 换行，LF 会让 cmd 解析失败。
+#   因此对 .bat 一律关闭 git 的换行/编码转换（-text = 当二进制处理）。
+# ---------------------------------------------------------------------------
+
+* text=auto eol=lf
+
+*.bat   -text
+*.cmd   -text
+
+*.ps1   text eol=crlf
+*.psm1  text eol=crlf
+
+*.md    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.json  text eol=lf
+*.py    text eol=lf
+*.html  text eol=lf
+*.txt   text eol=lf
+
+# 编译中间产物
+src/        export-ignore
+build-out/  export-ignore
+dist/       export-ignore
+.cuda/      export-ignore

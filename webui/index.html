@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-page-node-id="GqJsXzzBdU0PJ7RYTmBtPB">
+<head data-page-node-id="cK5CEwVCKFKM4v7OJeKIVq">
+<meta charset="utf-8" data-page-node-id="OdNwyattC1ZUaysEuQxnWX">
+<meta name="viewport" content="width=device-width, initial-scale=1" data-page-node-id="wE0JZoDAAv4wUpasaAfHic">
+<title>gpt-oss 本地聊天</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family:"Microsoft YaHei","PingFang SC",sans-serif; background:#f0f2f5; height:100vh; display:flex; flex-direction:column; }
+header { background:#1a73e8; color:#fff; padding:10px 16px; display:flex; align-items:center; flex-wrap:wrap; gap:10px; }
+header h1 { font-size:16px; font-weight:600; margin-right:auto; }
+header label { font-size:13px; }
+header select { padding:4px 6px; border-radius:4px; border:none; font-size:13px; }
+#status { font-size:12px; opacity:.85; }
+#chat { flex:1; overflow-y:auto; padding:16px; }
+.msg { max-width:80%; margin:8px 0; padding:10px 14px; border-radius:10px; line-height:1.6; font-size:14px; word-wrap:break-word; white-space:pre-wrap; }
+.user { background:#1a73e8; color:#fff; margin-left:auto; }
+.assistant { background:#fff; color:#222; box-shadow:0 1px 2px rgba(0,0,0,.08); }
+.think { background:#f6f7f9; border:1px solid #e0e3e8; border-radius:8px; margin-bottom:8px; font-size:13px; color:#666; }
+.think summary { cursor:pointer; padding:6px 10px; color:#888; user-select:none; }
+.think .body { padding:0 10px 8px; white-space:pre-wrap; }
+.msg code { background:#eef1f5; padding:1px 5px; border-radius:3px; font-family:Consolas,monospace; font-size:13px; }
+.msg pre { background:#282c34; color:#abb2bf; padding:10px; border-radius:8px; overflow-x:auto; margin:6px 0; white-space:pre; }
+.msg pre code { background:none; padding:0; color:inherit; }
+#inputbar { background:#fff; padding:12px 16px; display:flex; gap:10px; align-items:flex-end; box-shadow:0 -1px 4px rgba(0,0,0,.06); }
+#input { flex:1; resize:none; height:52px; padding:10px; font-size:14px; font-family:inherit; border:1px solid #d0d5dd; border-radius:8px; outline:none; }
+#input:focus { border-color:#1a73e8; }
+button { padding:12px 22px; border:none; border-radius:8px; font-size:14px; cursor:pointer; color:#fff; }
+#send { background:#1a73e8; }
+#send:disabled { background:#9db8d9; cursor:default; }
+#stop { background:#d93025; display:none; }
+footer { text-align:center; font-size:12px; color:#999; padding:4px 0 8px; background:#f0f2f5; }
+</style>
+</head>
+<body data-page-node-id="QdHffJDLCDyp60RaD1wzbd">
+<header data-page-node-id="ZQJQYaiHKsWOsapr0wmkkE">
+  <h1><span id="mname">…</span> 本地聊天</h1>
+  <label data-page-node-id="jWZOrU2hp3Z53NUz1Hbki4">思考强度
+    <select id="effort" data-page-node-id="Xh1cxibaVK8LnO5nuFCXp0">
+      <option value="low" data-page-node-id="RfwpjXz15JdW1KkNce0du7">low（快）</option>
+      <option value="medium" selected data-page-node-id="vWhuWoXM3mf3DcRqllZkYB">medium（默认）</option>
+      <option value="high" data-page-node-id="3HBZe2GYHMqPYgiJWdO4Fu">high（深思）</option>
+    </select>
+  </label>
+  <span id="status" data-page-node-id="zaXQRHkNkrn91CsxkJsRfy">连接中…</span>
+</header>
+<div id="chat" data-page-node-id="LxmcLkg6XoIC3nDMPTvLdM"></div>
+<div id="inputbar" data-page-node-id="Q0DGIpD89Lh5NrYen8pyDs">
+  <textarea id="input" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
+  <button id="send" data-page-node-id="GSAcm7PrAIb5pFJVY2FNTC">发送</button>
+  <button id="stop" data-page-node-id="ZnjK3936HJGhgp9rZcMa7Y">停止</button>
+</div>
+<footer data-page-node-id="6fnElj2Gew4d524yGThJt7">服务地址 http://127.0.0.1:8080 · 由 gptqidong.bat 启动 · Ctrl+F5 可刷新页面</footer>
+<script>
+var chatEl = document.getElementById('chat');
+var inputEl = document.getElementById('input');
+var sendBtn = document.getElementById('send');
+var stopBtn = document.getElementById('stop');
+var statusEl = document.getElementById('status');
+var effortEl = document.getElementById('effort');
+var history = [];   // {role, content}
+var controller = null;
+var generating = false;
+
+function checkHealth() {
+  var x = new XMLHttpRequest();
+  x.open('GET', '/health', true);
+  x.timeout = 5000;
+  x.onload = function () {
+    if (x.status === 200) { statusEl.textContent = '● 已连接'; statusEl.style.color = '#b7f4b7'; }
+    else { statusEl.textContent = '● 模型加载中…'; setTimeout(checkHealth, 2000); }
+  };
+  x.onerror = function () { statusEl.textContent = '● 无法连接服务'; statusEl.style.color = '#ffb3ad'; };
+  try { x.send(); } catch (e) { x.onerror(); }
+}
+checkHealth();
+
+function loadModelName() {
+  var x = new XMLHttpRequest();
+  x.open('GET', '/v1/models', true);
+  x.timeout = 5000;
+  x.onload = function () {
+    try {
+      var j = JSON.parse(x.responseText);
+      var id = (j.data && j.data[0] && j.data[0].id) ? j.data[0].id : '';
+      id = id.split('/').pop().replace(/\.gguf$/i, '');
+      if (id) document.getElementById('mname').textContent = id;
+    } catch (e) { document.getElementById('mname').textContent = '本地模型'; }
+  };
+  x.onerror = function () { document.getElementById('mname').textContent = '本地模型'; };
+  try { x.send(); } catch (e) { x.onerror(); }
+}
+loadModelName();
+
+function esc(s) {
+  var d = document.createElement('div');
+  d.textContent = s == null ? '' : s;
+  return d.innerHTML;
+}
+function fmt(text) {
+  var s = esc(text);
+  s = s.replace(/```([\s\S]*?)```/g, function (m, c) { return '<pre><code>' + c.replace(/^\n/, '') + '</code></pre>'; });
+  s = s.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+  s = s.replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>');
+  return s;
+}
+function addBubble(cls) {
+  var div = document.createElement('div');
+  div.className = 'msg ' + cls;
+  chatEl.appendChild(div);
+  chatEl.scrollTop = chatEl.scrollHeight;
+  return div;
+}
+function scrollBottom() { chatEl.scrollTop = chatEl.scrollHeight; }
+
+function setGenerating(on) {
+  generating = on;
+  sendBtn.disabled = on;
+  stopBtn.style.display = on ? 'block' : 'none';
+}
+
+function send() {
+  var text = inputEl.value.replace(/^\s+|\s+$/g, '');
+  if (!text || generating) return;
+  inputEl.value = '';
+  addBubble('user').textContent = text;
+  history.push({ role: 'user', content: text });
+
+  var bubble = addBubble('assistant');
+  var thinkBox = null, thinkBody = null;
+  var answerEl = null;
+  var rawThink = '', rawAnswer = '';
+  setGenerating(true);
+  controller = new AbortController();
+
+  fetch('/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      messages: history,
+      stream: true,
+      max_tokens: 8192,
+      chat_template_kwargs: { reasoning_effort: effortEl.value }
+    }),
+    signal: controller.signal
+  }).then(function (res) {
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    var reader = res.body.getReader();
+    var decoder = new TextDecoder('utf-8');
+    var buf = '';
+
+    function pump() {
+      return reader.read().then(function (r) {
+        if (r.done) { finish(); return; }
+        buf += decoder.decode(r.value, { stream: true });
+        var lines = buf.split('\n');
+        buf = lines.pop();
+        for (var i = 0; i < lines.length; i++) {
+          var line = lines[i].replace(/^\r/, '');
+          if (line.indexOf('data: ') !== 0) continue;
+          var payload = line.slice(6).replace(/^\s+|\s+$/g, '');
+          if (payload === '[DONE]') { finish(); return; }
+          var delta = null;
+          try {
+            var obj = JSON.parse(payload);
+            delta = obj.choices && obj.choices[0] && obj.choices[0].delta;
+          } catch (e) { continue; }
+          if (!delta) continue;
+          if (delta.reasoning_content) {
+            if (!thinkBox) {
+              thinkBox = document.createElement('details');
+              thinkBox.className = 'think';
+              thinkBox.open = true;
+              var sum = document.createElement('summary');
+              sum.textContent = '💭 思考过程（点击折叠）';
+              thinkBody = document.createElement('div');
+              thinkBody.className = 'body';
+              thinkBox.appendChild(sum);
+              thinkBox.appendChild(thinkBody);
+              bubble.insertBefore(thinkBox, bubble.firstChild);
+              answerEl = document.createElement('div');
+              bubble.appendChild(answerEl);
+            }
+            rawThink += delta.reasoning_content;
+            thinkBody.textContent = rawThink;
+            scrollBottom();
+          }
+          if (delta.content) {
+            if (!answerEl) { answerEl = document.createElement('div'); bubble.appendChild(answerEl); }
+            rawAnswer += delta.content;
+            answerEl.innerHTML = fmt(rawAnswer);
+            scrollBottom();
+          }
+        }
+        return pump();
+      });
+    }
+    return pump();
+  }).catch(function (err) {
+    if (err.name === 'AbortError') { finish(); return; }
+    if (!rawAnswer && !rawThink) bubble.innerHTML = '<span style="color:#d93025">出错了：' + esc(String(err)) + '。请确认服务已启动（双击 gptqidong.bat）。</span>';
+    finish();
+  });
+
+  function finish() {
+    if (rawAnswer) history.push({ role: 'assistant', content: rawAnswer });
+    if (thinkBox) thinkBox.open = false;
+    setGenerating(false);
+    controller = null;
+  }
+}
+
+stopBtn.onclick = function () { if (controller) controller.abort(); };
+sendBtn.onclick = send;
+inputEl.addEventListener('keydown', function (e) {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+});
+inputEl.focus();
+</script>
+</body>
+</html>

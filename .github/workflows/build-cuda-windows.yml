@@ -1,0 +1,317 @@
+name: Build llama.cpp for Windows (CUDA, 兼容 Volta / 老驱动)
+
+# ============================================================================
+#  这个工作流解决的核心问题
+#  ---------------------------------------------------------------------------
+#  官方 llama.cpp 的 Windows CUDA 预编译包是用 CUDA 12.4 / 13.x 编译的，
+#  里面【没有 sm_70 的 SASS 机器码】，只能靠 PTX JIT 运行；
+#  而老驱动（例：536.25 = CUDA 12.2）读不懂 PTX ISA 8.4，于是报
+#      CUDA error: the provided PTX was compiled with an unsupported toolchain.
+#  Tesla V100 / P100 / Titan V（compute capability 7.0）在旧驱动机器上因此完全跑不起来。
+#
+#  本工作流的做法：用与驱动同代的 CUDA 工具链（默认 12.2.0）重新编译，
+#  并显式指定 -DCMAKE_CUDA_ARCHITECTURES=70（只生成 sm_70 真机码），
+#  于是产物在驱动 536.25 上可以原生执行，既不需要 PTX JIT，也不需要升驱动。
+#
+#  判据（选 CUDA 版本的依据）：
+#    · 用 CUDA <= 12.2 编译  -> PTX ISA <= 8.2，老驱动一定能跑
+#    · 用 CUDA >= 12.3 编译  -> 必须内嵌 sm_70 的 SASS，官方包不满足
+# ============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      llama_ref:
+        description: "llama.cpp 版本：master，或某个 tag（如 b10853 / b10901）"
+        required: true
+        default: "master"
+      cuda_version:
+        description: "CUDA 工具链版本。12.2.0 兼容驱动 536.25；11.8.0 兼容更老驱动"
+        required: true
+        default: "12.2.0"
+      cuda_arch:
+        description: "GPU 计算能力。V100=70、P100=60、RTX20系=75、RTX30系=86；多档用分号如 70;86"
+        required: true
+        default: "70"
+      asset_tag:
+        description: "产物发布到哪个 Release 标签（同名标签会被覆盖更新）"
+        required: true
+        default: "cuda12.2-sm70"
+      publish_release:
+        description: "是否发布到 Release（true 发布 / false 只留 Artifact）"
+        required: true
+        default: "true"
+
+  # 改动了构建配方 / 脚本 / 启动模板时自动重新编译，省得手动点
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/build-cuda-windows.yml"
+      - "build/**"
+      - "templates/**"
+      - "tools/**"
+      - "scripts/**"
+      - "webui/**"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  LLAMA_REF: ${{ inputs.llama_ref || 'master' }}
+  CUDA_VERSION: ${{ inputs.cuda_version || '12.2.0' }}
+  CUDA_ARCH: ${{ inputs.cuda_arch || '70' }}
+  ASSET_TAG: ${{ inputs.asset_tag || 'cuda12.2-sm70' }}
+  PUBLISH: ${{ inputs.publish_release || 'true' }}
+
+jobs:
+  build:
+    name: CUDA ${{ inputs.cuda_version || '12.2.0' }} / sm_${{ inputs.cuda_arch || '70' }} / ${{ inputs.llama_ref || 'master' }}
+    runs-on: windows-2022
+    timeout-minutes: 240
+
+    steps:
+      - name: 检出本仓库
+        uses: actions/checkout@v4
+
+      - name: 准备 MSVC (x64) 环境
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: 环境自检
+        shell: pwsh
+        run: |
+          Write-Host "== 构建参数 =="
+          Write-Host "  llama_ref    : $env:LLAMA_REF"
+          Write-Host "  cuda_version : $env:CUDA_VERSION"
+          Write-Host "  cuda_arch    : $env:CUDA_ARCH"
+          Write-Host "  asset_tag    : $env:ASSET_TAG"
+          Write-Host "  publish      : $env:PUBLISH"
+          Write-Host "== 工具链 =="
+          cmake --version | Select-Object -First 1
+          ninja --version
+          (Get-Command cl.exe).Source
+          Write-Host "== 磁盘 =="
+          Get-PSDrive C | Select-Object Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}}
+
+      - name: 安装 CUDA ${{ env.CUDA_VERSION }}（官方 redist 组件，免管理员、免完整安装包）
+        shell: pwsh
+        run: |
+          ./build/setup-cuda-redist.ps1 -CudaVersion $env:CUDA_VERSION -Root "$env:RUNNER_TEMP\cuda-$env:CUDA_VERSION"
+
+      - name: 打印 CUDA 布局（排障用）
+        shell: pwsh
+        run: |
+          Write-Host "CUDA_PATH = $env:CUDA_PATH"
+          Write-Host "--- bin (前 15) ---"
+          Get-ChildItem "$env:CUDA_PATH\bin" -ErrorAction SilentlyContinue | Select-Object -First 15 Name
+          Write-Host "--- include\crt ---"
+          Get-ChildItem "$env:CUDA_PATH\include\crt" -ErrorAction SilentlyContinue | Select-Object -First 10 Name
+          Write-Host "--- nvvm ---"
+          Get-ChildItem "$env:CUDA_PATH\nvvm\bin" -ErrorAction SilentlyContinue | Select-Object -First 10 Name
+          Write-Host "--- nvcc 版本 ---"
+          & "$env:CUDA_PATH\bin\nvcc.exe" --version
+
+      - name: 取得 llama.cpp 源码
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch "$env:LLAMA_REF" https://github.com/ggml-org/llama.cpp.git src
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::$env:LLAMA_REF 拉取失败，回退 master"
+            git clone --depth 1 https://github.com/ggml-org/llama.cpp.git src
+          }
+          git -C src log -1 --format="commit %H%ndate   %ad%nsubj   %s"
+          git -C src describe --tags --always
+
+      - name: CMake 配置
+        shell: pwsh
+        run: |
+          # 说明：
+          #   GGML_BACKEND_DL=OFF  -> 单文件 exe，不依赖 ggml-*.dll，部署最简单
+          #   GGML_NATIVE=OFF      -> 不针对本机 CPU 特化，产物可换电脑使用
+          #   GGML_OPENMP=OFF      -> 去掉 libomp.dll 依赖（推理全在 GPU，无性能损失）
+          #   GGML_CUDA_FA_ALL_QUANTS=ON -> 让 FlashAttention 支持 q8_0 量化 KV 缓存
+          #   LLAMA_CURL=OFF       -> 不依赖 curl/openssl，省一堆麻烦
+          #   CMAKE_CUDA_ARCHITECTURES -> 只出目标架构的真机码（关键！）
+          cmake -S src -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_CUDA_COMPILER="$env:CUDA_PATH\bin\nvcc.exe" `
+            -DCMAKE_CUDA_ARCHITECTURES="$env:CUDA_ARCH" `
+            -DCMAKE_CUDA_FLAGS="-allow-unsupported-compiler -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH" `
+            -DGGML_CUDA=ON `
+            -DGGML_NATIVE=OFF `
+            -DGGML_OPENMP=OFF `
+            -DGGML_BACKEND_DL=OFF `
+            -DGGML_CUDA_FA_ALL_QUANTS=ON `
+            -DLLAMA_CURL=OFF `
+            -DLLAMA_BUILD_TESTS=OFF `
+            -DLLAMA_BUILD_EXAMPLES=ON `
+            -DLLAMA_BUILD_TOOLS=ON `
+            -DLLAMA_BUILD_SERVER=ON
+          if ($LASTEXITCODE -ne 0) { throw "CMake 配置失败" }
+
+      - name: 编译（约 20-40 分钟）
+        shell: pwsh
+        run: |
+          cmake --build build --config Release -j $env:NUMBER_OF_PROCESSORS
+          if ($LASTEXITCODE -ne 0) { throw "编译失败" }
+
+      - name: 校验产物（关键：确认内嵌了目标架构的真机码）
+        shell: pwsh
+        run: |
+          $exe = "build\bin\llama-server.exe"
+          if (-not (Test-Path $exe)) { throw "没有生成 $exe" }
+          Write-Host "llama-server.exe 体积: {0:N1} MB" -f ((Get-Item $exe).Length/1MB)
+
+          $obj = "$env:CUDA_PATH\bin\cuobjdump.exe"
+          if (-not (Test-Path $obj)) { $obj = "$env:CUDA_PATH\bin\x64\cuobjdump.exe" }
+          if (Test-Path $obj) {
+            Write-Host "`n=== cuobjdump --list-elf （真机码 / SASS）==="
+            $elf = (& $obj --list-elf $exe 2>&1 | Out-String)
+            Write-Host $elf
+            Write-Host "`n=== cuobjdump --list-ptx （PTX 中间码，越少越好）==="
+            $ptx = (& $obj --list-ptx $exe 2>&1 | Out-String)
+            Write-Host $ptx
+
+            $want = @()
+            foreach ($a in $env:CUDA_ARCH -split ';') { $want += ("sm_" + $a.Trim()) }
+            foreach ($w in $want) {
+              if ($elf -notmatch [regex]::Escape($w)) {
+                throw "产物中没有找到 $w 的真机码，架构参数未生效！"
+              }
+            }
+            Write-Host "`n[OK] 架构校验通过：$($want -join ', ')"
+          } else {
+            Write-Host "::warning::找不到 cuobjdump，跳过架构校验"
+          }
+
+          Write-Host "`n=== 产物清单 ==="
+          Get-ChildItem build\bin | Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,1)}} | Format-Table -AutoSize
+
+      - name: 组装发布包
+        shell: pwsh
+        run: |
+          $stage = "dist\llamacpp"
+          Remove-Item dist -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          # 1) llama.cpp 全部产物
+          Copy-Item "build\bin\*" $stage -Recurse -Force
+
+          # 2) CUDA 运行时 DLL（目标机器不需要装 CUDA 工具包）
+          $rt = @("cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll")
+          foreach ($d in @("$env:CUDA_PATH\bin", "$env:CUDA_PATH\bin\x64")) {
+            if (Test-Path $d) {
+              Get-ChildItem $d -Include $rt -File -ErrorAction SilentlyContinue |
+                ForEach-Object { Copy-Item $_.FullName $stage -Force; Write-Host "运行时: $($_.Name)" }
+            }
+          }
+          if (-not (Get-ChildItem $stage -Filter "cudart64_*.dll")) {
+            throw "没找到 CUDA 运行时 DLL，产物会无法启动"
+          }
+
+          # 3) 网页界面
+          New-Item -ItemType Directory -Force -Path "$stage\webui" | Out-Null
+          Copy-Item webui\index.html "$stage\webui\index.html" -Force
+
+          # 4) 中文启动脚本（仓库里存放的就是 GBK + CRLF 的成品，直接复制）
+          New-Item -ItemType Directory -Force -Path "$stage\scripts" | Out-Null
+          Copy-Item "scripts\*" "$stage\scripts\" -Recurse -Force
+
+          # 5) 模型目录占位
+          New-Item -ItemType Directory -Force -Path "$stage\models" | Out-Null
+          Copy-Item "models\README.md" "$stage\models\README.md" -Force
+
+          # 6) 构建信息
+          $info = @(
+            "llama.cpp   : $env:LLAMA_REF ($(git -C src rev-parse --short HEAD))",
+            "CUDA 工具链 : $env:CUDA_VERSION",
+            "CUDA 架构   : $env:CUDA_ARCH",
+            "构建时间    : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') UTC)",
+            "构建主机    : GitHub Actions windows-2022",
+            "仓库        : $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY",
+            "",
+            "说明：本包为「解压即用」。把整个目录放到 D:\llamacpp，",
+            "      再把 .gguf 模型放进 models\ ，双击 scripts 里的启动脚本即可。"
+          ) -join "`r`n"
+          [System.IO.File]::WriteAllText("$PWD\$stage\BUILD-INFO.txt", $info, (New-Object System.Text.UTF8Encoding $false))
+
+          # 6) 解压即用说明（GBK，记事本直接打开不乱码）
+          $qs = @"
+================================================================
+ llama.cpp 解压即用包  ·  Windows x64 + CUDA $env:CUDA_VERSION  ·  sm_$env:CUDA_ARCH
+================================================================
+
+【这个包是什么】
+  已经编译好、且不需要装 CUDA 工具包的 llama.cpp 服务端。
+  针对 compute capability $env:CUDA_ARCH 的老卡（Tesla V100 / P100 等）与旧版驱动编译，
+  驱动不必升级。
+
+【怎么用（3 步）】
+  1. 把本目录整个放到  D:\llamacpp
+  2. 把 .gguf 模型文件放进  D:\llamacpp\models\
+  3. 双击  D:\llamacpp\scripts\  里面你要用的那个启动脚本
+
+  启动后浏览器打开 http://127.0.0.1:8080 即可对话。
+  接其他软件（Cherry Studio / Open WebUI / OpenClaw 等）填 API：
+      http://127.0.0.1:8080/v1
+
+【目录说明】
+  *.exe *.dll        程序本体（含 CUDA 运行库，无需另装）
+  scripts\           中文启动/停止脚本
+  webui\             简洁的网页聊天界面
+  models\            模型放这里（.gguf 文件，需自行下载）
+  BUILD-INFO.txt     本次构建的版本信息
+
+【想改参数】
+  scripts 里的 .bat 用记事本打开就能改（编码是 GBK，不要另存为 UTF-8）。
+  或者用仓库里的 tools\gen-bats.py 重新生成一份，省得手改编码。
+
+【出问题】
+  看仓库 docs\04-故障排查手册.md，或把黑窗口里的报错截图发出来。
+
+  常见两条：
+    · CUDA error: invalid device function  -> 脚本里的 set GGML_CUDA_PDL=0 被删了，加回去
+    · 页面打不开                            -> 看黑窗口里 --port 是几，地址就用几
+"@
+          [System.IO.File]::WriteAllText("$stage\README-快速开始.txt", $qs, [System.Text.Encoding]::GetEncoding(936))
+
+          # 7) 压缩
+          $name = "llamacpp-win-x64-cuda$($env:CUDA_VERSION)-sm$($env:CUDA_ARCH)_$($env:LLAMA_REF).zip"
+          $name = $name -replace '[\\/:*?"<>|]', '-'
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path "$stage\*" -DestinationPath "dist\$name" -CompressionLevel Optimal
+          Write-Host "产物: dist\$name  {0:N1} MB" -f ((Get-Item "dist\$name").Length/1MB)
+          "ASSET_NAME=$name" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "ASSET_PATH=dist\$name" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: 上传为 Artifact（每次都留一份，便于对比）
+        uses: actions/upload-artifact@v4
+        with:
+          name: llamacpp-cuda${{ env.CUDA_VERSION }}-sm${{ env.CUDA_ARCH }}-${{ env.LLAMA_REF }}
+          path: ${{ env.ASSET_PATH }}
+          retention-days: 30
+
+      - name: 发布到 Release
+        if: ${{ env.PUBLISH == 'true' }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 仓库根放一个简短的解压即用说明
+          $readme = "解压后用\README-快速开始.txt"
+          Copy-Item "docs\解压即用-快速开始.txt" $readme -Force -ErrorAction SilentlyContinue
+
+          gh release view "$env:ASSET_TAG" 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release $env:ASSET_TAG 已存在，更新资产"
+            gh release upload "$env:ASSET_TAG" "$env:ASSET_PATH" --clobber
+          } else {
+            gh release create "$env:ASSET_TAG" "$env:ASSET_PATH" `
+              --title "llama.cpp Windows x64 · CUDA $env:CUDA_VERSION · sm_$env:CUDA_ARCH" `
+              --notes "由 GitHub Actions 自动编译并发布。适配 Tesla V100 等 compute capability $env:CUDA_ARCH 的老卡 + 旧版驱动（无需升驱动、无需 CUDA 工具包，解压即用）。下载下面的 zip 即可。"
+          }

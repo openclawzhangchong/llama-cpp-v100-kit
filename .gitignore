@@ -1,0 +1,28 @@
+# ---- 模型权重（体积巨大，绝不入库）
+*.gguf
+*.safetensors
+*.bin
+*.pt
+
+# ---- 编译产物与工具链
+src/
+build-out/
+dist/
+.cuda/
+*.zip
+*.exe
+*.dll
+*.lib
+*.obj
+*.pdb
+!scripts/*.bat
+
+# ---- 本地临时文件
+.tok
+*.log
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
