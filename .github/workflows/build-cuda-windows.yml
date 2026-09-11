@@ -241,44 +241,47 @@ jobs:
           [System.IO.File]::WriteAllText("$PWD\$stage\BUILD-INFO.txt", $info, (New-Object System.Text.UTF8Encoding $false))
 
           # 6) 解压即用说明（GBK，记事本直接打开不乱码）
-          $qs = @"
-================================================================
- llama.cpp 解压即用包  ·  Windows x64 + CUDA $env:CUDA_VERSION  ·  sm_$env:CUDA_ARCH
-================================================================
-
-【这个包是什么】
-  已经编译好、且不需要装 CUDA 工具包的 llama.cpp 服务端。
-  针对 compute capability $env:CUDA_ARCH 的老卡（Tesla V100 / P100 等）与旧版驱动编译，
-  驱动不必升级。
-
-【怎么用（3 步）】
-  1. 把本目录整个放到  D:\llamacpp
-  2. 把 .gguf 模型文件放进  D:\llamacpp\models\
-  3. 双击  D:\llamacpp\scripts\  里面你要用的那个启动脚本
-
-  启动后浏览器打开 http://127.0.0.1:8080 即可对话。
-  接其他软件（Cherry Studio / Open WebUI / OpenClaw 等）填 API：
-      http://127.0.0.1:8080/v1
-
-【目录说明】
-  *.exe *.dll        程序本体（含 CUDA 运行库，无需另装）
-  scripts\           中文启动/停止脚本
-  webui\             简洁的网页聊天界面
-  models\            模型放这里（.gguf 文件，需自行下载）
-  BUILD-INFO.txt     本次构建的版本信息
-
-【想改参数】
-  scripts 里的 .bat 用记事本打开就能改（编码是 GBK，不要另存为 UTF-8）。
-  或者用仓库里的 tools\gen-bats.py 重新生成一份，省得手改编码。
-
-【出问题】
-  看仓库 docs\04-故障排查手册.md，或把黑窗口里的报错截图发出来。
-
-  常见两条：
-    · CUDA error: invalid device function  -> 脚本里的 set GGML_CUDA_PDL=0 被删了，加回去
-    · 页面打不开                            -> 看黑窗口里 --port 是几，地址就用几
-"@
-          [System.IO.File]::WriteAllText("$stage\README-快速开始.txt", $qs, [System.Text.Encoding]::GetEncoding(936))
+          #    注意：这里用数组拼接而不是 here-string。
+          #    PowerShell 的 here-string 结束符 "@ 必须顶在行首，
+          #    而 YAML 的 run: | 块遇到行首未缩进的行就会终止 —— 两者冲突会让工作流直接解析失败。
+          $qs = @(
+            '================================================================',
+            " llama.cpp 解压即用包  ·  Windows x64 + CUDA $env:CUDA_VERSION  ·  sm_$env:CUDA_ARCH",
+            '================================================================',
+            '',
+            '【这个包是什么】',
+            '  已经编译好、且不需要装 CUDA 工具包的 llama.cpp 服务端。',
+            "  针对 compute capability $env:CUDA_ARCH 的老卡（Tesla V100 / P100 等）与旧版驱动编译，",
+            '  驱动不必升级。',
+            '',
+            '【怎么用（3 步）】',
+            '  1. 把本目录整个放到  D:\llamacpp',
+            '  2. 把 .gguf 模型文件放进  D:\llamacpp\models\',
+            '  3. 双击  D:\llamacpp\scripts\  里面你要用的那个启动脚本',
+            '',
+            '  启动后浏览器打开 http://127.0.0.1:8080 即可对话。',
+            '  接其他软件（Cherry Studio / Open WebUI / OpenClaw 等）填 API：',
+            '      http://127.0.0.1:8080/v1',
+            '',
+            '【目录说明】',
+            '  *.exe *.dll        程序本体（含 CUDA 运行库，无需另装）',
+            '  scripts\           中文启动/停止脚本',
+            '  webui\             简洁的网页聊天界面',
+            '  models\            模型放这里（.gguf 文件，需自行下载）',
+            '  BUILD-INFO.txt     本次构建的版本信息',
+            '',
+            '【想改参数】',
+            '  scripts 里的 .bat 用记事本打开就能改（编码是 GBK，不要另存为 UTF-8）。',
+            '  或者用仓库里的 tools\gen-bats.py 重新生成一份，省得手改编码。',
+            '',
+            '【出问题】',
+            '  看仓库 docs\04-故障排查手册.md，或把黑窗口里的报错截图发出来。',
+            '',
+            '  常见两条：',
+            '    · CUDA error: invalid device function  -> 脚本里的 set GGML_CUDA_PDL=0 被删了，加回去',
+            '    · 页面打不开                            -> 看黑窗口里 --port 是几，地址就用几'
+          )
+          [System.IO.File]::WriteAllText("$stage\README-快速开始.txt", ($qs -join "`r`n"), [System.Text.Encoding]::GetEncoding(936))
 
           # 7) 压缩
           $name = "llamacpp-win-x64-cuda$($env:CUDA_VERSION)-sm$($env:CUDA_ARCH)_$($env:LLAMA_REF).zip"
