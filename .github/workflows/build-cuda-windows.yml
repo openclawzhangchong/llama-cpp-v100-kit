@@ -160,37 +160,71 @@ jobs:
           cmake --build build --config Release -j $env:NUMBER_OF_PROCESSORS
           if ($LASTEXITCODE -ne 0) { throw "编译失败" }
 
-      - name: 校验产物（关键：确认内嵌了目标架构的真机码）
+      - name: 产物体检（列出内嵌的 GPU 架构，记录结论供后续步骤判定）
         shell: pwsh
         run: |
+          # 说明：这一步只做「体检 + 记录」，不做硬闸。
+          #   硬闸放在上传 Artifact 之后，这样即使判定失败，编了半小时的产物也还留着可查。
+          #   另：Write-Host 里用 -f 格式化时必须写成 ("..." -f (...))，
+          #   否则 PowerShell 会把 -f 当成 -ForegroundColor 的缩写而报错。
           $exe = "build\bin\llama-server.exe"
           if (-not (Test-Path $exe)) { throw "没有生成 $exe" }
-          Write-Host "llama-server.exe 体积: {0:N1} MB" -f ((Get-Item $exe).Length/1MB)
+          Write-Host ("llama-server.exe 体积: {0:N1} MB" -f ((Get-Item $exe).Length / 1MB))
 
           $obj = "$env:CUDA_PATH\bin\cuobjdump.exe"
           if (-not (Test-Path $obj)) { $obj = "$env:CUDA_PATH\bin\x64\cuobjdump.exe" }
-          if (Test-Path $obj) {
-            Write-Host "`n=== cuobjdump --list-elf （真机码 / SASS）==="
-            $elf = (& $obj --list-elf $exe 2>&1 | Out-String)
-            Write-Host $elf
-            Write-Host "`n=== cuobjdump --list-ptx （PTX 中间码，越少越好）==="
-            $ptx = (& $obj --list-ptx $exe 2>&1 | Out-String)
-            Write-Host $ptx
-
-            $want = @()
-            foreach ($a in $env:CUDA_ARCH -split ';') { $want += ("sm_" + $a.Trim()) }
-            foreach ($w in $want) {
-              if ($elf -notmatch [regex]::Escape($w)) {
-                throw "产物中没有找到 $w 的真机码，架构参数未生效！"
-              }
-            }
-            Write-Host "`n[OK] 架构校验通过：$($want -join ', ')"
-          } else {
-            Write-Host "::warning::找不到 cuobjdump，跳过架构校验"
+          if (-not (Test-Path $obj)) {
+            Write-Host "::warning::找不到 cuobjdump，无法体检架构"
+            "ARCH_OK=unknown" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            exit 0
           }
 
+          # CUDA kernel 可能内嵌在 exe（本工作流 GGML_BACKEND_DL=OFF，静态链接），
+          # 也可能放在 ggml-cuda.dll 里（官方预编译包就是这种）。两种都扫，避免误判。
+          $cands = Get-ChildItem build\bin -File |
+                   Where-Object { $_.Extension -in '.exe', '.dll' -and $_.Length -gt 1MB } |
+                   Sort-Object Length -Descending
+
+          $rows = @()
+          $sassAll = ""; $ptxAll = ""
+          foreach ($c in $cands) {
+            $e = (& $obj --list-elf $c.FullName 2>&1 | Out-String)
+            $q = (& $obj --list-ptx $c.FullName 2>&1 | Out-String)
+            $eS = (([regex]::Matches($e, 'sm_\d+[a-z]?')) | ForEach-Object { $_.Value } | Sort-Object -Unique) -join ' '
+            $qS = (([regex]::Matches($q, 'sm_\d+[a-z]?')) | ForEach-Object { $_.Value } | Sort-Object -Unique) -join ' '
+            if ($eS -or $qS) {
+              $rows += [pscustomobject]@{ '产物' = $c.Name; '真机码SASS' = $eS; 'PTX' = $qS }
+              $sassAll += " $eS"; $ptxAll += " $qS"
+            }
+          }
+
+          Write-Host "`n=== 各产物内嵌的 GPU 架构 ==="
+          if ($rows.Count -gt 0) { $rows | Format-Table -AutoSize | Out-String | Write-Host }
+          else { Write-Host "  （所有产物都没内嵌 GPU 代码 —— 很可疑，下面会判定不过）" }
+
+          $want = @()
+          foreach ($a in $env:CUDA_ARCH -split ';') { $want += ("sm_" + $a.Trim()) }
+          Write-Host "目标架构: $($want -join ', ')"
+
+          $missSass = @($want | Where-Object { $sassAll -notmatch "\b$_\b" })
+          $missAny  = @($want | Where-Object { ($sassAll + $ptxAll) -notmatch "\b$_\b" })
+
+          if ($missAny.Count -gt 0) {
+            $verdict = 'false'
+            Write-Host "::error::产物里完全没有 $($missAny -join ', ') 的 GPU 代码，架构参数没生效"
+          } elseif ($missSass.Count -gt 0) {
+            $verdict = 'true'
+            Write-Host "::warning::$($missSass -join ', ') 只有 PTX 没有真机码。CUDA $env:CUDA_VERSION 产生的 PTX ISA 是 8.2，老驱动可以 JIT，能用但首次加载稍慢。"
+          } else {
+            $verdict = 'true'
+            Write-Host "`n[OK] 目标架构已内嵌真机码：$($want -join ', ')"
+          }
+          "ARCH_OK=$verdict" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
           Write-Host "`n=== 产物清单 ==="
-          Get-ChildItem build\bin | Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,1)}} | Format-Table -AutoSize
+          Get-ChildItem build\bin -File |
+            Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,1)}} |
+            Sort-Object MB -Descending | Format-Table -AutoSize
 
       - name: 组装发布包
         shell: pwsh
@@ -203,15 +237,21 @@ jobs:
           Copy-Item "build\bin\*" $stage -Recurse -Force
 
           # 2) CUDA 运行时 DLL（目标机器不需要装 CUDA 工具包）
-          $rt = @("cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll")
+          #    注意：这里不能用  Get-ChildItem $d -Include <通配> —— 没有通配路径或 -Recurse 时
+          #    -Include 会静默返回空，导致运行时 DLL 一个都复制不到。改用 Where-Object 过滤。
+          #    nvJitLink / nvrtc 是 CUDA 12.x 里 cublasLt 的运行时依赖，必须一起带上。
+          $rtRe = '^(cudart64_|cublas64_|cublasLt64_|nvJitLink_|nvrtc64_|nvrtc-builtins64_).*\.dll$'
           foreach ($d in @("$env:CUDA_PATH\bin", "$env:CUDA_PATH\bin\x64")) {
             if (Test-Path $d) {
-              Get-ChildItem $d -Include $rt -File -ErrorAction SilentlyContinue |
+              Get-ChildItem $d -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -match $rtRe } |
                 ForEach-Object { Copy-Item $_.FullName $stage -Force; Write-Host "运行时: $($_.Name)" }
             }
           }
-          if (-not (Get-ChildItem $stage -Filter "cudart64_*.dll")) {
-            throw "没找到 CUDA 运行时 DLL，产物会无法启动"
+          foreach ($need in @("cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll")) {
+            if (-not (Get-ChildItem $stage -Filter $need -ErrorAction SilentlyContinue)) {
+              throw "缺少 CUDA 运行时 $need，产物会无法启动"
+            }
           }
 
           # 3) 网页界面
@@ -288,7 +328,7 @@ jobs:
           $name = $name -replace '[\\/:*?"<>|]', '-'
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Compress-Archive -Path "$stage\*" -DestinationPath "dist\$name" -CompressionLevel Optimal
-          Write-Host "产物: dist\$name  {0:N1} MB" -f ((Get-Item "dist\$name").Length/1MB)
+          Write-Host ("产物: dist\$name  {0:N1} MB" -f ((Get-Item "dist\$name").Length / 1MB))
           "ASSET_NAME=$name" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "ASSET_PATH=dist\$name" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
@@ -299,16 +339,47 @@ jobs:
           path: ${{ env.ASSET_PATH }}
           retention-days: 30
 
+      - name: 冒烟测试（确认产物能加载、动态库依赖齐全）
+        shell: pwsh
+        run: |
+          # 这一步只在「解压后的成品目录」里跑，用来证明打包没漏 DLL。
+          # 运行器没有 GPU，所以不要求它真的初始化 CUDA —— 只要求它不是「缺 DLL 起不来」。
+          $exe = "$PWD\dist\llamacpp\llama-server.exe"
+          if (-not (Test-Path $exe)) { throw "打包目录里没有 llama-server.exe" }
+
+          $tmp = Join-Path $env:RUNNER_TEMP "smoke.txt"
+          $p = Start-Process -FilePath $exe -ArgumentList "--version" `
+                 -NoNewWindow -Wait -PassThru `
+                 -RedirectStandardOutput $tmp -RedirectStandardError "$tmp.err"
+          $out = (Get-Content $tmp -Raw -ErrorAction SilentlyContinue) +
+                 (Get-Content "$tmp.err" -Raw -ErrorAction SilentlyContinue)
+          Write-Host "退出码: $($p.ExitCode)"
+          Write-Host "---- 输出 ----"
+          Write-Host $out
+
+          # 典型的「缺 DLL」特征
+          $bad = 'was not found|找不到|could not be located|0xc0000135|ImportError|DLL load failed'
+          if ($out -match $bad) {
+            throw "产物缺依赖库，无法加载（见上面的输出）"
+          }
+          Write-Host "[OK] 产物可以加载，动态库依赖齐全"
+
+      - name: 架构硬校验（发布前最后一道闸）
+        shell: pwsh
+        run: |
+          # 放在上传 Artifact 之后：判定不过也不会白编，Artifact 里留着完整产物可排查。
+          switch ($env:ARCH_OK) {
+            'false'   { throw "产物未包含目标架构的 GPU 代码，拒绝发布（Artifact 已保留，可下载排查）" }
+            'unknown' { Write-Host "::warning::没能确认架构（缺 cuobjdump），仍继续发布" }
+            default   { Write-Host "[OK] 架构校验通过，可以发布" }
+          }
+
       - name: 发布到 Release
         if: ${{ env.PUBLISH == 'true' }}
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 仓库根放一个简短的解压即用说明
-          $readme = "解压后用\README-快速开始.txt"
-          Copy-Item "docs\解压即用-快速开始.txt" $readme -Force -ErrorAction SilentlyContinue
-
           gh release view "$env:ASSET_TAG" 2>$null
           if ($LASTEXITCODE -eq 0) {
             Write-Host "Release $env:ASSET_TAG 已存在，更新资产"
